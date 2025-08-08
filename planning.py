@@ -26,6 +26,9 @@ class Employee:
     role: str
     contraintes_speciales: Dict
     competences: List[str]
+    disponible: bool = True  # Nouveau : disponibilité
+    motif_indisponibilite: str = ""  # Nouveau : raison si indisponible
+    jours_absence: int = 0  # Nouveau : nombre de jours d'absence dans la semaine (0-7)
     jours_off_consecutifs: Optional[bool] = None
 
     def __post_init__(self):
@@ -37,6 +40,17 @@ class Employee:
             self.jours_semaine = 3
         elif self.type_contrat == 'nuit':
             self.jours_semaine = 5
+
+    @property
+    def jours_travail_max_semaine(self):
+        """Calcule le nombre maximum de jours de travail possible cette semaine"""
+        if not self.disponible:
+            return 0
+        elif self.jours_absence >= 7:
+            return 0
+        else:
+            # Jours contractuels moins les jours d'absence, minimum 0
+            return max(0, self.jours_semaine - self.jours_absence)
 
 # ================================
 # SYSTEME DE PLANNING
@@ -79,6 +93,12 @@ class HotelPlanningSystem:
             besoin_total_matin = min(besoin_total_matin, max_personnel_disponible)
             besoin_total_apres_midi = min(besoin_total_apres_midi, max_personnel_disponible)
 
+            # Ajustement selon l'occupation - si faible, on peut réduire les besoins
+            total_activite = nb_checkins + nb_checkouts
+            if total_activite < 100:  # Occupation faible
+                besoin_total_matin = max(1, besoin_total_matin - 1)
+                besoin_total_apres_midi = max(1, besoin_total_apres_midi - 1)
+
             besoins[jour] = {
                 'matin': {
                     'total_personnel': besoin_total_matin,  # Total superviseurs + réceptionnistes
@@ -91,12 +111,62 @@ class HotelPlanningSystem:
                     'concierge': 0  # Concierge uniquement le matin
                 },
                 'nuit': {
-                    'receptionists': self.nb_night_receptionists_required,
+                    'receptionists': min(self.nb_night_receptionists_required, 
+                                       len([e for e in self.employees if e.role == 'receptionniste' 
+                                           and e.type_contrat == 'nuit' and e.disponible])),
                     'superviseurs': 0,
                     'concierge': 0
                 }
             }
         return besoins
+
+    def get_employees_disponibles(self) -> List[Employee]:
+        """Retourne uniquement les employés disponibles"""
+        return [emp for emp in self.employees if emp.disponible]
+
+    def verifier_faisabilite_planning(self, besoins: Dict) -> Dict:
+        """Vérifie si le planning est réalisable avec l'équipe disponible"""
+        employes_disponibles = self.get_employees_disponibles()
+        superviseurs_dispo = [e for e in employes_disponibles if e.role == 'superviseur']
+        receptionnistes_jour_dispo = [e for e in employes_disponibles if e.role == 'receptionniste' and e.type_contrat != 'nuit']
+        receptionnistes_nuit_dispo = [e for e in employes_disponibles if e.role == 'receptionniste' and e.type_contrat == 'nuit']
+        concierges_dispo = [e for e in employes_disponibles if e.role == 'concierge']
+
+        problemes = []
+        recommandations = []
+
+        # Vérifications critiques
+        if len(superviseurs_dispo) < 1:
+            problemes.append("❌ CRITIQUE: Aucun superviseur disponible")
+        elif len(superviseurs_dispo) < 2:
+            recommandations.append("⚠️ Un seul superviseur disponible - couverture limitée")
+
+        if len(receptionnistes_nuit_dispo) < 2:
+            if len(receptionnistes_nuit_dispo) == 0:
+                problemes.append("❌ CRITIQUE: Aucun réceptionniste de nuit disponible")
+            else:
+                problemes.append("❌ CRITIQUE: Un seul réceptionniste de nuit disponible (2 requis)")
+
+        if len(concierges_dispo) == 0:
+            recommandations.append("⚠️ Concierge indisponible - service limité en semaine")
+
+        # Calcul de la charge de travail
+        total_personnel_jour = len(superviseurs_dispo) + len(receptionnistes_jour_dispo)
+        if total_personnel_jour < 3:
+            problemes.append("❌ Personnel jour insuffisant (minimum 3 pour couvrir les shifts)")
+
+        return {
+            'faisable': len(problemes) == 0,
+            'problemes': problemes,
+            'recommandations': recommandations,
+            'stats': {
+                'total_disponibles': len(employes_disponibles),
+                'superviseurs': len(superviseurs_dispo),
+                'receptionnistes_jour': len(receptionnistes_jour_dispo),
+                'receptionnistes_nuit': len(receptionnistes_nuit_dispo),
+                'concierges': len(concierges_dispo)
+            }
+        }
 
     def generer_planning_optimise(self, checkins: Dict[str, int], checkouts: Dict[str, int], semaine_debut: datetime) -> Dict:
         besoins = self.calculer_besoins_personnel(checkins, checkouts)
@@ -131,55 +201,73 @@ class HotelPlanningSystem:
         return self._extraire_planning(x)
 
     def _ajouter_contraintes(self, prob, x, besoins):
-        # Listes des employés par type
-        superviseurs = [e for e in self.employees if e.role == 'superviseur']
-        receptionnistes_jour = [e for e in self.employees if e.role == 'receptionniste' and e.type_contrat != 'nuit']
-        receptionnistes_nuit = [e for e in self.employees if e.role == 'receptionniste' and e.type_contrat == 'nuit']
-        concierges = [e for e in self.employees if e.role == 'concierge']
+        # Listes des employés par type - SEULEMENT LES DISPONIBLES
+        employes_disponibles = self.get_employees_disponibles()
+        superviseurs = [e for e in employes_disponibles if e.role == 'superviseur']
+        receptionnistes_jour = [e for e in employes_disponibles if e.role == 'receptionniste' and e.type_contrat != 'nuit']
+        receptionnistes_nuit = [e for e in employes_disponibles if e.role == 'receptionniste' and e.type_contrat == 'nuit']
+        concierges = [e for e in employes_disponibles if e.role == 'concierge']
+
+        # Contrainte : les employés indisponibles ne peuvent pas être assignés
+        for emp in self.employees:
+            if not emp.disponible:
+                for jour in self.jours_semaine:
+                    for shift in ['matin', 'apres_midi', 'nuit']:
+                        prob += x[emp.prenom][jour][shift] == 0
 
         # Contraintes de couverture par shift
         for jour in self.jours_semaine:
             for shift in ['matin', 'apres_midi', 'nuit']:
                 if shift == 'nuit':
-                    # Exactement 2 réceptionnistes de nuit
-                    prob += lpSum([x[e.prenom][jour][shift] for e in receptionnistes_nuit]) == self.nb_night_receptionists_required
+                    # Réceptionnistes de nuit selon disponibilité
+                    nb_requis = min(besoins[jour][shift]['receptionists'], len(receptionnistes_nuit))
+                    if nb_requis > 0:
+                        prob += lpSum([x[e.prenom][jour][shift] for e in receptionnistes_nuit]) == nb_requis
                     
                     # Aucun autre type d'employé la nuit
-                    autres = [e for e in self.employees if e not in receptionnistes_nuit]
+                    autres = [e for e in employes_disponibles if e not in receptionnistes_nuit]
                     for emp in autres:
                         prob += x[emp.prenom][jour][shift] == 0
                 else:
-                    # Shifts jour : au moins 1 superviseur obligatoire
-                    prob += lpSum([x[s.prenom][jour][shift] for s in superviseurs]) >= 1
+                    # Shifts jour : au moins 1 superviseur si disponible
+                    if len(superviseurs) > 0:
+                        prob += lpSum([x[s.prenom][jour][shift] for s in superviseurs]) >= 1
 
-                    # Nombre total de personnel selon les besoins (superviseurs + réceptionnistes)
+                    # Nombre total de personnel selon les besoins et disponibilité
                     nb_besoin = besoins[jour][shift]['total_personnel']
-                    prob += (
-                        lpSum([x[e.prenom][jour][shift] for e in receptionnistes_jour]) +
-                        lpSum([x[s.prenom][jour][shift] for s in superviseurs])
-                    ) >= nb_besoin
+                    personnel_jour_disponible = superviseurs + receptionnistes_jour
+                    nb_possible = min(nb_besoin, len(personnel_jour_disponible))
+                    
+                    if nb_possible > 0:
+                        prob += (
+                            lpSum([x[e.prenom][jour][shift] for e in receptionnistes_jour]) +
+                            lpSum([x[s.prenom][jour][shift] for s in superviseurs])
+                        ) >= nb_possible
 
-                    # Concierge : obligatoire en semaine le matin, interdit le weekend et l'après-midi
-                    if jour not in ['Samedi', 'Dimanche'] and shift == 'matin':
+                    # Concierge : selon disponibilité
+                    if jour not in ['Samedi', 'Dimanche'] and shift == 'matin' and len(concierges) > 0:
                         prob += lpSum([x[c.prenom][jour][shift] for c in concierges]) == 1
                     else:
-                        prob += lpSum([x[c.prenom][jour][shift] for c in concierges]) == 0
+                        for c in concierges:
+                            prob += x[c.prenom][jour][shift] == 0
 
                     # Maximum 4 personnes par shift
-                    tous_employes_jour = superviseurs + receptionnistes_jour + concierges
-                    prob += lpSum([x[e.prenom][jour][shift] for e in tous_employes_jour]) <= self.max_receptionists_per_shift
+                    tous_employes_jour = personnel_jour_disponible + concierges
+                    if len(tous_employes_jour) > 0:
+                        prob += lpSum([x[e.prenom][jour][shift] for e in tous_employes_jour]) <= self.max_receptionists_per_shift
 
-        # Contraintes par employé
-        for emp in self.employees:
+        # Contraintes par employé - SEULEMENT LES DISPONIBLES
+        for emp in employes_disponibles:
             # Un seul shift par jour maximum
             for jour in self.jours_semaine:
                 prob += lpSum([x[emp.prenom][jour][shift] for shift in ['matin', 'apres_midi', 'nuit']]) <= 1
 
-            # Respect du nombre de jours contractuels
+            # Respect du nombre de jours de travail disponibles (contractuels - absences)
+            jours_max_cette_semaine = emp.jours_travail_max_semaine
             prob += lpSum([
                 lpSum([x[emp.prenom][jour][shift] for shift in ['matin', 'apres_midi', 'nuit']])
                 for jour in self.jours_semaine
-            ]) <= emp.jours_semaine
+            ]) <= jours_max_cette_semaine
 
             # Contrainte : maximum 5 jours consécutifs de travail
             for i in range(len(self.jours_semaine) - 5):
@@ -686,10 +774,13 @@ def initialiser_equipe_conforme(system):
             jours_semaine=5,
             role="superviseur",
             contraintes_speciales={},
-            competences=["Management", "Accueil", "Anglais", "Formation"]
+            competences=["Management", "Accueil", "Anglais", "Formation"],
+            disponible=True,
+            motif_indisponibilite="",
+            jours_absence=0
         ))
 
-    # === 6 RÉCEPTIONNISTES JOUR (5 temps plein + 1 mi-temps 4j + 1 mi-temps 3j) mais total 6 ===
+    # === 6 RÉCEPTIONNISTES JOUR ===
     # 4 réceptionnistes temps plein
     for i in range(1, 5):
         system.ajouter_employe(Employee(
@@ -699,7 +790,10 @@ def initialiser_equipe_conforme(system):
             jours_semaine=5,
             role="receptionniste",
             contraintes_speciales={},
-            competences=["Accueil", "Anglais"]
+            competences=["Accueil", "Anglais"],
+            disponible=True,
+            motif_indisponibilite="",
+            jours_absence=0
         ))
     
     # 1 réceptionniste mi-temps 4 jours
@@ -710,7 +804,10 @@ def initialiser_equipe_conforme(system):
         jours_semaine=4,
         role="receptionniste",
         contraintes_speciales={},
-        competences=["Accueil", "Anglais"]
+        competences=["Accueil", "Anglais"],
+        disponible=True,
+        motif_indisponibilite="",
+        jours_absence=0
     ))
     
     # 1 réceptionniste mi-temps 3 jours
@@ -721,7 +818,10 @@ def initialiser_equipe_conforme(system):
         jours_semaine=3,
         role="receptionniste",
         contraintes_speciales={},
-        competences=["Accueil", "Anglais"]
+        competences=["Accueil", "Anglais"],
+        disponible=True,
+        motif_indisponibilite="",
+        jours_absence=0
     ))
 
     # === 3 RÉCEPTIONNISTES DE NUIT ===
@@ -733,7 +833,10 @@ def initialiser_equipe_conforme(system):
             jours_semaine=5,
             role="receptionniste",
             contraintes_speciales={"horaires": "nuit"},
-            competences=["Accueil", "Anglais", "Sécurité"]
+            competences=["Accueil", "Anglais", "Sécurité"],
+            disponible=True,
+            motif_indisponibilite="",
+            jours_absence=0
         ))
 
     # === 1 CONCIERGE (off weekend, uniquement matin) ===
@@ -744,7 +847,10 @@ def initialiser_equipe_conforme(system):
         jours_semaine=5,
         role="concierge",
         contraintes_speciales={"jours_off": "weekend", "horaires": "matin_uniquement"},
-        competences=["Conciergerie", "Anglais", "Tourisme"]
+        competences=["Conciergerie", "Anglais", "Tourisme"],
+        disponible=True,
+        motif_indisponibilite="",
+        jours_absence=0
     ))
 
 # ================================
@@ -794,40 +900,229 @@ def main():
         if system.employees:
             st.subheader("📋 Composition Actuelle")
             
-            # Résumé par type
+            # Résumé par type avec statuts
             cols = st.columns(4)
             with cols[0]:
                 nb_superviseurs = len([e for e in system.employees if e.role == 'superviseur'])
-                st.metric("Superviseurs", nb_superviseurs, help="Font aussi office de réceptionnistes")
+                nb_superviseurs_dispo = len([e for e in system.employees if e.role == 'superviseur' and e.disponible])
+                st.metric("Superviseurs", f"{nb_superviseurs_dispo}/{nb_superviseurs}", help="Disponibles/Total")
             with cols[1]:
                 nb_recep_jour = len([e for e in system.employees if e.role == 'receptionniste' and e.type_contrat != 'nuit'])
-                st.metric("Réceptionnistes jour", nb_recep_jour)
+                nb_recep_jour_dispo = len([e for e in system.employees if e.role == 'receptionniste' and e.type_contrat != 'nuit' and e.disponible])
+                st.metric("Réceptionnistes jour", f"{nb_recep_jour_dispo}/{nb_recep_jour}", help="Disponibles/Total")
             with cols[2]:
                 nb_recep_nuit = len([e for e in system.employees if e.role == 'receptionniste' and e.type_contrat == 'nuit'])
-                st.metric("Réceptionnistes nuit", nb_recep_nuit)
+                nb_recep_nuit_dispo = len([e for e in system.employees if e.role == 'receptionniste' and e.type_contrat == 'nuit' and e.disponible])
+                st.metric("Réceptionnistes nuit", f"{nb_recep_nuit_dispo}/{nb_recep_nuit}", help="Disponibles/Total")
             with cols[3]:
                 nb_concierges = len([e for e in system.employees if e.role == 'concierge'])
-                st.metric("Concierge", nb_concierges)
+                nb_concierges_dispo = len([e for e in system.employees if e.role == 'concierge' and e.disponible])
+                st.metric("Concierge", f"{nb_concierges_dispo}/{nb_concierges}", help="Disponibles/Total")
             
-            # Vérification de la composition
+            # Vérification de la faisabilité
+            employes_disponibles = len([e for e in system.employees if e.disponible])
             total_equipe = len(system.employees)
-            composition_ok = (nb_superviseurs == 5 and nb_recep_jour == 6 and nb_recep_nuit == 3 and nb_concierges == 1)
             
-            if total_equipe == 15 and composition_ok:
-                st.success("✅ Équipe complète et conforme (15 personnes)")
+            if employes_disponibles >= 8:  # Minimum viable
+                st.success(f"✅ Équipe opérationnelle : {employes_disponibles}/{total_equipe} personnes disponibles")
+            elif employes_disponibles >= 5:
+                st.warning(f"⚠️ Équipe réduite : {employes_disponibles}/{total_equipe} personnes disponibles - Planning limité possible")
             else:
-                st.warning(f"⚠️ Équipe actuelle: {total_equipe}/15 personnes. Composition attendue: 5 superviseurs + 6 réceptionnistes jour + 3 réceptionnistes nuit + 1 concierge")
+                st.error(f"❌ Équipe insuffisante : {employes_disponibles}/{total_equipe} personnes disponibles - Planning impossible")
             
-            # Tableau détaillé
-            df = pd.DataFrame([{
-                'Prénom': e.prenom,
-                'Nom': e.nom,
-                'Rôle': e.role.title(),
-                'Contrat': e.type_contrat.replace('_', ' ').title(),
-                'Jours/sem': e.jours_semaine,
-                'Compétences': ', '.join(e.competences)
-            } for e in system.employees])
-            st.dataframe(df, use_container_width=True)
+            # Tableau détaillé avec statuts et jours d'absence
+            df_data = []
+            for e in system.employees:
+                status_icon = "✅" if e.disponible else "❌"
+                if e.disponible and e.jours_absence > 0:
+                    status_text = f"Partiellement disponible ({e.jours_travail_max_semaine}/{e.jours_semaine}j) - {e.motif_indisponibilite}"
+                elif e.disponible:
+                    status_text = f"Disponible ({e.jours_semaine}j)"
+                else:
+                    status_text = f"Indisponible - {e.motif_indisponibilite}"
+                
+                df_data.append({
+                    'Statut': status_icon,
+                    'Prénom': e.prenom,
+                    'Nom': e.nom,
+                    'Rôle': e.role.title(),
+                    'Contrat': e.type_contrat.replace('_', ' ').title(),
+                    'Jours Contractuels': e.jours_semaine,
+                    'Jours Absence': e.jours_absence if e.disponible else "N/A",
+                    'Jours Travail Max': e.jours_travail_max_semaine,
+                    'Disponibilité': status_text,
+                    'Compétences': ', '.join(e.competences)
+                })
+            
+            df = pd.DataFrame(df_data)
+            
+            # Style conditionnel pour le tableau
+            def highlight_status(row):
+                colors = []
+                for col in df.columns:
+                    if row['Statut'] == '❌':
+                        colors.append('background-color: #ffecec; color: #666666')
+                    elif row['Jours Travail Max'] < row['Jours Contractuels'] and row['Jours Travail Max'] > 0:
+                        colors.append('background-color: #fff8e1; color: #333333')
+                    else:
+                        colors.append('')
+                return colors
+            
+            styled_df = df.style.apply(highlight_status, axis=1)
+            st.dataframe(styled_df, use_container_width=True)
+
+        # Gestion des disponibilités
+        with st.expander("📋 Gestion des Disponibilités"):
+            st.markdown("**Marquer des employés comme indisponibles (maladie, congés, etc.)**")
+            
+            # Sélection d'un employé à modifier
+            employes_options = [f"{e.prenom} {e.nom} ({e.role}) - {'Disponible' if e.disponible else 'Indisponible'}" for e in system.employees]
+            employe_a_modifier_dispo = st.selectbox("Choisir l'employé", options=employes_options, key="modify_availability")
+            
+            if employe_a_modifier_dispo:
+                # Trouver l'employé sélectionné
+                prenom_nom_info = employe_a_modifier_dispo.split(' (')[0]
+                parts = prenom_nom_info.split(' ')
+                if len(parts) >= 2:
+                    prenom_sel = parts[0]
+                    nom_sel = ' '.join(parts[1:])
+                else:
+                    prenom_sel = parts[0]
+                    nom_sel = ""
+                
+                # Trouver l'objet employé
+                employe_sel = None
+                for emp in system.employees:
+                    if emp.prenom == prenom_sel and emp.nom == nom_sel:
+                        employe_sel = emp
+                        break
+                
+                if employe_sel:
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        nouveau_statut = st.radio(
+                            f"Statut de {employe_sel.prenom} {employe_sel.nom}",
+                            options=["Disponible", "Partiellement disponible", "Indisponible"],
+                            index=0 if employe_sel.disponible and employe_sel.jours_absence == 0 
+                                  else (1 if employe_sel.disponible and employe_sel.jours_absence > 0 
+                                       else 2),
+                            key="availability_status"
+                        )
+                        
+                        # Nombre de jours d'absence si partiellement disponible
+                        jours_absence = 0
+                        if nouveau_statut == "Partiellement disponible":
+                            jours_absence = st.slider(
+                                f"Nombre de jours d'absence sur la semaine",
+                                min_value=1,
+                                max_value=min(6, employe_sel.jours_semaine),
+                                value=min(employe_sel.jours_absence if employe_sel.jours_absence > 0 else 1, employe_sel.jours_semaine),
+                                key="days_absence"
+                            )
+                            
+                            jours_travail_restants = employe_sel.jours_semaine - jours_absence
+                            st.info(f"📊 Jours de travail restants : {jours_travail_restants}/{employe_sel.jours_semaine}")
+                    
+                    with col2:
+                        motif = ""
+                        if nouveau_statut in ["Partiellement disponible", "Indisponible"]:
+                            motif = st.selectbox(
+                                "Motif",
+                                options=["Maladie", "Congés payés", "RTT", "Formation", "Congé maternité/paternité", 
+                                        "Accident de travail", "Congé sans solde", "Rendez-vous médical", "Autre"],
+                                key="unavailability_reason"
+                            )
+                            
+                            if motif == "Autre":
+                                motif = st.text_input("Préciser le motif", key="custom_reason")
+                        
+                        # Affichage des informations contractuelles
+                        st.write("**Informations contractuelles :**")
+                        st.write(f"• Contrat : {employe_sel.type_contrat.replace('_', ' ').title()}")
+                        st.write(f"• Jours contractuels : {employe_sel.jours_semaine} jours/semaine")
+                        if nouveau_statut == "Partiellement disponible":
+                            st.write(f"• **Disponible : {employe_sel.jours_semaine - jours_absence} jours cette semaine**")
+                    
+                    col_save, col_reset = st.columns([1, 1])
+                    
+                    with col_save:
+                        if st.button("💾 Mettre à jour le statut", key="update_availability"):
+                            if nouveau_statut == "Disponible":
+                                employe_sel.disponible = True
+                                employe_sel.jours_absence = 0
+                                employe_sel.motif_indisponibilite = ""
+                                st.success(f"✅ {employe_sel.prenom} {employe_sel.nom} - Disponible ({employe_sel.jours_semaine}j)")
+                            elif nouveau_statut == "Partiellement disponible":
+                                employe_sel.disponible = True
+                                employe_sel.jours_absence = jours_absence
+                                employe_sel.motif_indisponibilite = motif
+                                jours_restants = employe_sel.jours_semaine - jours_absence
+                                st.warning(f"⚠️ {employe_sel.prenom} {employe_sel.nom} - Partiellement disponible ({jours_restants}j) - {motif}")
+                            else:  # Indisponible
+                                employe_sel.disponible = False
+                                employe_sel.jours_absence = 7  # Complètement absent
+                                employe_sel.motif_indisponibilite = motif
+                                st.error(f"❌ {employe_sel.prenom} {employe_sel.nom} - Indisponible - {motif}")
+                            st.rerun()
+                    
+                    with col_reset:
+                        if st.button("🔄 Remettre à 100%", key="reset_to_full"):
+                            employe_sel.disponible = True
+                            employe_sel.jours_absence = 0
+                            employe_sel.motif_indisponibilite = ""
+                            st.success(f"✅ {employe_sel.prenom} {employe_sel.nom} remis à 100% disponible")
+                            st.rerun()
+            
+            # Actions de groupe
+            st.markdown("---")
+            st.markdown("**Actions rapides sur l'équipe :**")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if st.button("✅ Tous disponibles", key="all_available"):
+                    for emp in system.employees:
+                        emp.disponible = True
+                        emp.motif_indisponibilite = ""
+                    st.success("✅ Toute l'équipe marquée comme disponible")
+                    st.rerun()
+            
+            with col2:
+                if st.button("🏖️ Weekend équipe réduite", key="reduced_weekend"):
+                    # Garde seulement les superviseurs et réceptionnistes de nuit disponibles
+                    for emp in system.employees:
+                        if emp.role in ['superviseur'] or (emp.role == 'receptionniste' and emp.type_contrat == 'nuit'):
+                            emp.disponible = True
+                            emp.motif_indisponibilite = ""
+                        else:
+                            emp.disponible = False
+                            emp.motif_indisponibilite = "Congés"
+                    st.info("ℹ️ Mode équipe réduite activé (superviseurs + nuit seulement)")
+                    st.rerun()
+            
+            with col3:
+                if st.button("🎯 Occupation faible", key="low_occupation"):
+                    # Garde 2-3 superviseurs, 1-2 réceptionnistes jour, 2 nuit, pas de concierge
+                    count_superviseurs = 0
+                    count_recep_jour = 0
+                    for emp in system.employees:
+                        if emp.role == 'superviseur' and count_superviseurs < 2:
+                            emp.disponible = True
+                            emp.motif_indisponibilite = ""
+                            count_superviseurs += 1
+                        elif emp.role == 'receptionniste' and emp.type_contrat != 'nuit' and count_recep_jour < 1:
+                            emp.disponible = True  
+                            emp.motif_indisponibilite = ""
+                            count_recep_jour += 1
+                        elif emp.role == 'receptionniste' and emp.type_contrat == 'nuit':
+                            emp.disponible = True
+                            emp.motif_indisponibilite = ""
+                        else:
+                            emp.disponible = False
+                            emp.motif_indisponibilite = "Congés - Occupation faible"
+                    st.info("ℹ️ Mode occupation faible activé (équipe minimale)")
+                    st.rerun()
 
         with st.expander("➕ Ajouter un Employé"):
             col1, col2 = st.columns(2)
@@ -892,7 +1187,7 @@ def main():
             if st.button("Ajouter cet Employé"):
                 if prenom and nom:
                     system.ajouter_employe(Employee(
-                        prenom, nom, type_contrat, 0, role, {}, competences
+                        prenom, nom, type_contrat, 0, role, {}, competences, True, "", 0
                     ))
                     st.success(f"✅ Employé {prenom} {nom} ajouté avec succès!")
                     st.rerun()
@@ -1075,26 +1370,56 @@ def main():
                     st.rerun()
             
             with col2:
-                if st.button("📋 Dupliquer un employé", key="duplicate_employee"):
-                    if system.employees:
-                        # Dupliquer le premier employé comme exemple
-                        emp_a_dupliquer = system.employees[0]
-                        nouveau_nom = f"{emp_a_dupliquer.prenom}_copie"
-                        system.ajouter_employe(Employee(
-                            prenom=nouveau_nom,
-                            nom=emp_a_dupliquer.nom,
-                            type_contrat=emp_a_dupliquer.type_contrat,
-                            jours_semaine=emp_a_dupliquer.jours_semaine,
-                            role=emp_a_dupliquer.role,
-                            contraintes_speciales=emp_a_dupliquer.contraintes_speciales.copy(),
-                            competences=emp_a_dupliquer.competences.copy()
-                        ))
-                        st.success(f"✅ Employé dupliqué : {nouveau_nom}")
-                        st.rerun()
-                    else:
-                        st.warning("Aucun employé à dupliquer")
-            
+                if st.button("🏥 Absences partielles", key="partial_absences"):
+                    # Simule des absences partielles réalistes
+                    import random
+                    absences_scenarios = [
+                        ("Maladie", 1, 2),  # 1-2 jours
+                        ("RTT", 1, 1),      # 1 jour
+                        ("Rendez-vous médical", 1, 1),  # 1 jour
+                        ("Formation", 2, 3),  # 2-3 jours
+                        ("Congés payés", 2, 4)  # 2-4 jours
+                    ]
+                    
+                    affected_count = 0
+                    for emp in system.employees:
+                        if emp.role != 'superviseur' and random.random() < 0.4:  # 40% de chance
+                            motif, min_days, max_days = random.choice(absences_scenarios)
+                            jours_absence = min(random.randint(min_days, max_days), emp.jours_semaine - 1)
+                            if jours_absence > 0:
+                                emp.disponible = True
+                                emp.jours_absence = jours_absence
+                                emp.motif_indisponibilite = motif
+                                affected_count += 1
+                    
+                    st.info(f"ℹ️ {affected_count} employé(s) avec absences partielles simulées")
+                    st.rerun()
+
             with col3:
+                if st.button("📊 Scénario réaliste", key="realistic_scenario"):
+                    # Scénario réaliste d'un front office
+                    scenarios = {
+                        "Superviseur1": (True, 0, ""),
+                        "Superviseur2": (True, 1, "RTT"),  # 1 jour RTT
+                        "Superviseur3": (True, 0, ""),
+                        "Recep1": (True, 2, "Congés payés"),  # 2 jours congés
+                        "Recep2": (False, 7, "Maladie"),  # Complètement malade
+                        "Recep3": (True, 1, "Rendez-vous médical"),  # 1 jour RDV
+                        "Night1": (True, 0, ""),
+                        "Night2": (True, 1, "Formation"),  # 1 jour formation
+                        "Night3": (True, 0, ""),
+                        "Concierge": (True, 3, "Congés payés")  # 3 jours congés
+                    }
+                    
+                    for emp in system.employees:
+                        if emp.prenom in scenarios:
+                            disponible, jours_abs, motif = scenarios[emp.prenom]
+                            emp.disponible = disponible
+                            emp.jours_absence = jours_abs if disponible else 7
+                            emp.motif_indisponibilite = motif
+                    
+                    st.info("ℹ️ Scénario réaliste appliqué (mix d'absences)")
+                    st.rerun()
                 # Compteur d'employés par type
                 nb_superviseurs = len([e for e in system.employees if e.role == 'superviseur'])
                 nb_recep_jour = len([e for e in system.employees if e.role == 'receptionniste' and e.type_contrat != 'nuit'])
@@ -1213,19 +1538,27 @@ def main():
     with tab3:
         st.header("📅 Génération du Planning")
         
-        # Vérifications préalables
-        col1, col2 = st.columns(2)
+        # Vérifications préalables avec nouvelles conditions
+        col1, col2, col3 = st.columns(3)
         with col1:
             besoins_ok = 'besoins' in st.session_state
             st.write("✅ Besoins calculés" if besoins_ok else "❌ Calculez d'abord les besoins")
         with col2:
-            equipe_ok = len(system.employees) == 15
-            st.write(f"✅ Équipe complète ({len(system.employees)} employés)" if equipe_ok else f"❌ Équipe incomplète ({len(system.employees)}/15 employés)")
+            employes_disponibles = len([e for e in system.employees if e.disponible])
+            equipe_ok = employes_disponibles >= 5  # Minimum viable
+            st.write(f"✅ Équipe disponible ({employes_disponibles} pers.)" if equipe_ok else f"❌ Équipe insuffisante ({employes_disponibles} pers.)")
+        with col3:
+            faisable = st.session_state.get('faisabilite', {}).get('faisable', True)
+            st.write("✅ Planning réalisable" if faisable else "❌ Planning impossible")
 
         if not besoins_ok:
             st.warning("⚠️ Calculez d'abord les besoins dans l'onglet 📊 Occupation.")
         elif not equipe_ok:
-            st.warning("⚠️ Équipe incomplète. L'équipe doit compter exactement 15 personnes.")
+            st.error("⚠️ Équipe insuffisante. Il faut au minimum 5 personnes disponibles pour générer un planning.")
+            st.info("💡 **Solutions** : Rendez plus d'employés disponibles dans l'onglet 👥 Équipe > Gestion des Disponibilités")
+        elif not faisable:
+            st.error("⚠️ Planning impossible avec l'équipe disponible. Consultez les problèmes dans l'onglet 📊 Occupation.")
+            st.info("💡 **Solutions** : Réduisez l'occupation prévue ou augmentez l'équipe disponible")
         else:
             # Date de début de semaine
             semaine_debut = st.date_input(
